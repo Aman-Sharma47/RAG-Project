@@ -6,30 +6,72 @@ from langchain_groq import ChatGroq
 load_dotenv()
 
 class RAGSearch:
-    def __init__(self, persist_dir: str = "faiss_store", embedding_model: str = "all-MiniLM-L6-v2", llm_model: str = "gemma2-9b-it"):
+    def __init__(self, persist_dir: str = "faiss_store", embedding_model: str = "all-MiniLM-L6-v2", llm_model: str = "llama-3.1-8b-instant"):
         self.vectorstore = FaissVectorStore(persist_dir, embedding_model)
         # Load or build vectorstore
         faiss_path = os.path.join(persist_dir, "faiss.index")
         meta_path = os.path.join(persist_dir, "metadata.pkl")
         if not (os.path.exists(faiss_path) and os.path.exists(meta_path)):
-            from data_loader import load_all_documents
+            from src.data_loader import load_all_documents
             docs = load_all_documents("data")
             self.vectorstore.build_from_documents(docs)
         else:
             self.vectorstore.load()
-        groq_api_key = ""
+        groq_api_key = os.getenv("GROQ_API_KEY", "")
+        if not groq_api_key:
+            raise ValueError("Missing GROQ_API_KEY. Add it to your .env file before running RAG summarization.")
         self.llm = ChatGroq(groq_api_key=groq_api_key, model_name=llm_model)
         print(f"[INFO] Groq LLM initialized: {llm_model}")
 
-    def search_and_summarize(self, query: str, top_k: int = 5) -> str:
-        results = self.vectorstore.query(query, top_k=top_k)
-        texts = [r["metadata"].get("text", "") for r in results if r["metadata"]]
-        context = "\n\n".join(texts)
-        if not context:
-            return "No relevant documents found."
-        prompt = f"""Summarize the following context for the query: '{query}'\n\nContext:\n{context}\n\nSummary:"""
+    @staticmethod
+    def _format_source(metadata: dict) -> str:
+        source = os.path.basename(metadata.get("source", "unknown source"))
+        page = metadata.get("page")
+        if isinstance(page, int):
+            return f"{source} (page {page + 1})"
+        return source
+
+    def retrieve(self, query: str, top_k: int = 5):
+        return self.vectorstore.query(query, top_k=top_k)
+
+    def answer_question(self, query: str, top_k: int = 5) -> dict:
+        results = self.retrieve(query, top_k=top_k)
+        contexts = []
+        sources = []
+
+        for result in results:
+            metadata = result.get("metadata") or {}
+            text = metadata.get("text", "").strip()
+            if not text:
+                continue
+            source_label = self._format_source(metadata)
+            contexts.append(f"Source: {source_label}\n{text}")
+            sources.append(
+                {
+                    "source": metadata.get("source", "unknown source"),
+                    "page": metadata.get("page"),
+                    "label": source_label,
+                    "text": text,
+                    "distance": result.get("distance"),
+                }
+            )
+
+        if not contexts:
+            return {"answer": "No relevant documents found.", "sources": []}
+
+        prompt = (
+            "Answer the user's question using only the provided context. "
+            "If the answer is not present in the context, say that clearly.\n\n"
+            f"Question: {query}\n\n"
+            "Context:\n"
+            + "\n\n".join(contexts)
+            + "\n\nAnswer:"
+        )
         response = self.llm.invoke([prompt])
-        return response.content
+        return {"answer": response.content, "sources": sources}
+
+    def search_and_summarize(self, query: str, top_k: int = 5) -> str:
+        return self.answer_question(query, top_k=top_k)["answer"]
 
 # Example usage
 if __name__ == "__main__":
